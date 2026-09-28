@@ -72,6 +72,7 @@
   <p>Unità: millimetri. Carica un file, scegli come ricavare la scala, converti e scarica il DXF.</p>
 </header>
 
+<div class="error hidden" id="serverBanner" style="margin:16px 16px 0"></div>
 <main>
   <section class="panel">
     <div class="drop" id="drop">
@@ -367,20 +368,53 @@ $("convert").onclick = async () => {
   btn.disabled = true; btn.textContent = "Conversione in corso…";
   try {
     const q = new URLSearchParams({ filename: file.name, options: JSON.stringify(options) });
-    const res = await fetch("/api/convert?" + q, { method: "POST", body: file });
-    const data = await res.json();
+    let res;
+    try {
+      res = await fetch("/api/convert?" + q, { method: "POST", body: file });
+    } catch (_) {
+      throw new Error(NO_SERVER);
+    }
+    const data = await readJson(res);
     if (!data.ok) throw new Error(data.error || "Errore sconosciuto");
     result = data;
     calFactor = options.calibrate ?
       Number(options.calibrate.split(",")[1]) / Number(options.calibrate.split(",")[0]) : 1;
     showResult();
   } catch (e) {
-    showError(e.message.includes("fetch") ?
-      "Server non raggiungibile: avvia 'python -m dxfconv.web' e apri la pagina da lì." : e.message);
+    showError(e.message);
   } finally {
     btn.disabled = false; btn.textContent = "Converti in DXF";
   }
 };
+
+const NO_SERVER =
+  "Questa pagina non è servita da dxfconv, quindi non può convertire.\n" +
+  "Apri un terminale nella cartella del progetto ed esegui:\n" +
+  "    pip install -r requirements.txt\n" +
+  "    python -m dxfconv.web\n" +
+  "poi usa la pagina che si apre su http://127.0.0.1:8000/ " +
+  "(non aprire il file index.html con doppio clic o da un'anteprima).";
+
+// Only trust responses that really are JSON from the dxfconv server.
+async function readJson(res) {
+  const type = res.headers.get("content-type") || "";
+  if (!type.includes("application/json")) throw new Error(NO_SERVER);
+  return res.json();
+}
+
+async function checkServer() {
+  let ok = false;
+  if (location.protocol.startsWith("http")) {
+    try {
+      const data = await readJson(await fetch("/api/ping"));
+      ok = data.app === "dxfconv";
+    } catch (_) { /* not our server */ }
+  }
+  const banner = $("serverBanner");
+  banner.textContent = NO_SERVER;
+  banner.classList.toggle("hidden", ok);
+}
+checkServer();
 
 function showError(msg) { $("error").textContent = msg; $("error").classList.remove("hidden"); }
 function hideError() { $("error").classList.add("hidden"); }

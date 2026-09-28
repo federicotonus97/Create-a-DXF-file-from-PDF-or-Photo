@@ -98,6 +98,8 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("/", "/index.html"):
             with open(os.path.join(STATIC_DIR, "index.html"), "rb") as f:
                 self._send(HTTPStatus.OK, f.read(), "text/html; charset=utf-8")
+        elif path == "/api/ping":
+            self._json(HTTPStatus.OK, {"ok": True, "app": "dxfconv"})
         else:
             self._send(HTTPStatus.NOT_FOUND, b"Not found", "text/plain")
 
