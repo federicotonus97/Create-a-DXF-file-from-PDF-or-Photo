@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dxfconv"
+version = "0.1.0"
+description = "Crea file DXF R12 in scala 1:1 da PDF o foto"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "ezdxf>=1.1",
+    "pymupdf>=1.23",
+    "opencv-python-headless>=4.8",
+    "numpy>=1.24",
+    "pillow>=9",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+dxfconv = "dxfconv.cli:main"
+
+[tool.setuptools]
+packages = ["dxfconv"]
