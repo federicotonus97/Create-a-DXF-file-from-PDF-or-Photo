@@ -1,3 +1,5 @@
+import urllib.parse
+import urllib.error
 import cv2
 import ezdxf
 import numpy as np
@@ -163,3 +165,33 @@ def test_image_without_scale_fails(tmp_path):
     cv2.imwrite(str(src), _synthetic_scan(100))
     with pytest.raises(SystemExit):
         run([str(src), "-o", str(tmp_path / "o.dxf")])
+
+
+def test_web_api(vector_pdf):
+    import json
+    import threading
+    import urllib.request
+    from http.server import ThreadingHTTPServer
+
+    from dxfconv.web import Handler
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        with urllib.request.urlopen(base + "/") as r:
+            assert b"dxfconv" in r.read()
+        q = urllib.parse.urlencode({"filename": "a.pdf", "options": json.dumps({"scale": 2})})
+        req = urllib.request.Request(base + "/api/convert?" + q, data=vector_pdf.read_bytes())
+        with urllib.request.urlopen(req) as r:
+            data = json.loads(r.read())
+        assert data["ok"]
+        assert "AC1009" in data["dxf"]
+        assert data["circles"][0]["radius"] == pytest.approx(30, abs=0.01)
+        # errors are reported as JSON, not as a crash
+        req = urllib.request.Request(base + "/api/convert?filename=x.png", data=b"not an image")
+        with pytest.raises(urllib.error.HTTPError) as err:
+            urllib.request.urlopen(req)
+        assert json.loads(err.value.read())["ok"] is False
+    finally:
+        server.shutdown()

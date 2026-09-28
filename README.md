@@ -23,6 +23,24 @@ python -m dxfconv foto.jpg --ref 120,340,980,352 --ref-length 200
 
 Dopo l'installazione con `pip install .` è disponibile anche il comando `dxfconv`.
 
+## Pagina web per provare
+
+```bash
+python -m dxfconv.web            # apre http://127.0.0.1:8000/ nel browser
+```
+
+La pagina (`dxfconv/static/index.html`) permette di:
+
+* trascinare un PDF o una foto e scegliere il metodo di scala;
+* **cliccare sull'immagine** i due punti di riferimento o i 4 angoli del foglio;
+* vedere l'**anteprima** del DXF con griglia da 10 mm, zoom e coordinate;
+* **misurare** una distanza sull'anteprima (con aggancio ai vertici) e usarla
+  per la calibrazione;
+* scaricare il file DXF.
+
+La conversione avviene sul tuo computer: il server ascolta solo su `127.0.0.1`
+(opzioni `--port`, `--host`, `--no-browser`).
+
 ## Come si ottiene la scala 1:1
 
 ### PDF vettoriale (esportato da CAD, Inkscape, Illustrator...)

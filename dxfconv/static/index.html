@@ -1,0 +1,558 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dxfconv – PDF/foto → DXF R12 1:1</title>
+<style>
+  :root {
+    --bg: #f5f6f8; --panel: #ffffff; --text: #1d2330; --muted: #667085;
+    --border: #d8dce3; --accent: #1f6feb; --accent-text: #ffffff;
+    --draw: #111827; --circle: #c2410c; --grid: #e7eaf0; --pick: #e11d48;
+    --error-bg: #fdecec; --error: #b42318;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1218; --panel: #171b23; --text: #e6e9ef; --muted: #98a2b3;
+      --border: #2b3240; --accent: #4c8dff; --accent-text: #0b0e13;
+      --draw: #e6e9ef; --circle: #fb923c; --grid: #222835; --pick: #fb7185;
+      --error-bg: #3a1a1a; --error: #fda29b;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  header { padding: 16px 20px; border-bottom: 1px solid var(--border); background: var(--panel); }
+  header h1 { margin: 0; font-size: 18px; }
+  header p { margin: 2px 0 0; color: var(--muted); }
+  main { display: grid; grid-template-columns: 340px 1fr; gap: 16px; padding: 16px; }
+  @media (max-width: 860px) { main { grid-template-columns: 1fr; } }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px; }
+  .panel h2 { font-size: 14px; margin: 0 0 10px; }
+  fieldset { border: 1px solid var(--border); border-radius: 8px; margin: 0 0 12px; padding: 8px 10px 10px; }
+  legend { font-weight: 600; padding: 0 4px; }
+  label { display: block; margin: 6px 0 2px; color: var(--muted); font-size: 12.5px; }
+  label.inline { display: flex; align-items: center; gap: 6px; color: var(--text); font-size: 14px; }
+  input[type=number], input[type=text], select {
+    width: 100%; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px;
+    background: var(--bg); color: var(--text); font: inherit;
+  }
+  .row { display: flex; gap: 8px; } .row > * { flex: 1; }
+  .drop {
+    border: 2px dashed var(--border); border-radius: 10px; padding: 18px; text-align: center;
+    cursor: pointer; color: var(--muted); margin-bottom: 12px;
+  }
+  .drop.over { border-color: var(--accent); color: var(--accent); }
+  .drop strong { color: var(--text); word-break: break-all; }
+  button {
+    font: inherit; padding: 8px 14px; border-radius: 6px; border: 1px solid var(--border);
+    background: var(--bg); color: var(--text); cursor: pointer;
+  }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); font-weight: 600; width: 100%; }
+  button:disabled { opacity: .5; cursor: default; }
+  .hint { color: var(--muted); font-size: 12.5px; margin: 6px 0 0; }
+  .hidden { display: none !important; }
+  .error { background: var(--error-bg); color: var(--error); padding: 8px 10px; border-radius: 6px; margin-top: 10px; white-space: pre-wrap; }
+  .views { display: grid; gap: 16px; min-width: 0; }
+  .stage { position: relative; display: inline-block; max-width: 100%; }
+  .stage img { display: block; max-width: 100%; max-height: 60vh; }
+  .stage svg { position: absolute; inset: 0; width: 100%; height: 100%; cursor: crosshair; }
+  .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 10px; }
+  .stats { color: var(--muted); }
+  .stats b { color: var(--text); }
+  #preview { width: 100%; height: 60vh; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); cursor: crosshair; touch-action: none; }
+  #coords { font-variant-numeric: tabular-nums; color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>dxfconv – da PDF o foto a DXF R12 in scala 1:1</h1>
+  <p>Unità: millimetri. Carica un file, scegli come ricavare la scala, converti e scarica il DXF.</p>
+</header>
+
+<main>
+  <section class="panel">
+    <div class="drop" id="drop">
+      <input type="file" id="file" accept=".pdf,.png,.jpg,.jpeg,.tif,.tiff,.bmp,.webp" hidden>
+      <div id="dropText">Trascina qui un <strong>PDF</strong> o una <strong>foto</strong><br>oppure clicca per sceglierlo</div>
+    </div>
+
+    <fieldset id="pdfBox" class="hidden">
+      <legend>PDF</legend>
+      <div class="row">
+        <div><label for="page">Pagina</label><input type="number" id="page" min="1" value="1"></div>
+        <div><label for="rasterDpi">DPI (se raster)</label><input type="number" id="rasterDpi" value="600" min="72"></div>
+      </div>
+      <label class="inline"><input type="checkbox" id="raster"> Forza vettorizzazione raster (PDF scansionato)</label>
+      <label class="inline"><input type="checkbox" id="noCircles"> Non riconoscere i cerchi</label>
+      <p class="hint">I PDF vettoriali vengono convertiti in modo esatto. I PDF scansionati vengono vettorizzati automaticamente.</p>
+    </fieldset>
+
+    <fieldset id="imgBox" class="hidden">
+      <legend>Scala dell'immagine</legend>
+      <select id="method">
+        <option value="sheet">Foto di un foglio di formato noto (corregge la prospettiva)</option>
+        <option value="ref">Due punti a distanza nota</option>
+        <option value="dpi">Scansione: DPI</option>
+        <option value="pxmm">Pixel per millimetro</option>
+      </select>
+
+      <div data-method="sheet">
+        <div class="row">
+          <div>
+            <label for="sheet">Formato</label>
+            <select id="sheet">
+              <option>A4</option><option>A3</option><option>A5</option><option>A2</option>
+              <option>A1</option><option>A0</option><option>LETTER</option><option>LEGAL</option>
+              <option value="custom">Personalizzato…</option>
+            </select>
+          </div>
+          <div id="customSheetBox" class="hidden"><label for="customSheet">L x H (mm)</label><input type="text" id="customSheet" placeholder="300x200"></div>
+        </div>
+        <label class="inline"><input type="checkbox" id="manualCorners"> Indico io i 4 angoli del foglio</label>
+        <p class="hint" id="cornersHint">Gli angoli vengono rilevati automaticamente: fotografa il foglio intero su uno sfondo scuro.</p>
+      </div>
+
+      <div data-method="ref" class="hidden">
+        <label for="refLength">Distanza reale fra i due punti (mm)</label>
+        <input type="number" id="refLength" step="any" placeholder="es. 100">
+        <p class="hint">Clicca due punti sull'immagine (es. due tacche di un righello). Funziona solo con foto scattate perpendicolari al disegno.</p>
+      </div>
+
+      <div data-method="dpi" class="hidden">
+        <label for="dpi">DPI della scansione</label>
+        <input type="number" id="dpi" step="any" placeholder="vuoto = letto dal file">
+      </div>
+
+      <div data-method="pxmm" class="hidden">
+        <label for="pxmm">Pixel per millimetro</label>
+        <input type="number" id="pxmm" step="any">
+      </div>
+    </fieldset>
+
+    <fieldset id="vecBox" class="hidden">
+      <legend>Vettorizzazione</legend>
+      <label for="mode">Modalità</label>
+      <select id="mode">
+        <option value="centerline">Asse delle linee (disegni tecnici)</option>
+        <option value="contour">Contorno delle sagome</option>
+      </select>
+      <div class="row">
+        <div>
+          <label for="threshold">Soglia</label>
+          <select id="threshold">
+            <option value="">Automatica</option>
+            <option value="otsu">Otsu (scansioni)</option>
+            <option value="adaptive">Adattiva (foto)</option>
+          </select>
+        </div>
+        <div><label for="minLength">Tratto minimo (mm)</label><input type="number" id="minLength" value="2" step="any" min="0"></div>
+      </div>
+      <label class="inline"><input type="checkbox" id="invert"> Linee chiare su sfondo scuro</label>
+    </fieldset>
+
+    <fieldset id="commonBox" class="hidden">
+      <legend>Scala finale</legend>
+      <div class="row">
+        <div><label for="scale">Fattore (es. 50 per 1:50)</label><input type="number" id="scale" value="1" step="any" min="0"></div>
+        <div><label for="tolerance">Tolleranza (mm)</label><input type="number" id="tolerance" step="any" min="0" placeholder="auto"></div>
+      </div>
+      <label>Calibrazione: misurato → reale (mm)</label>
+      <div class="row">
+        <input type="number" id="calMeasured" step="any" placeholder="misurato">
+        <input type="number" id="calReal" step="any" placeholder="reale">
+      </div>
+    </fieldset>
+
+    <button class="primary" id="convert" disabled>Converti in DXF</button>
+    <div class="error hidden" id="error"></div>
+  </section>
+
+  <section class="views">
+    <div class="panel hidden" id="imagePanel">
+      <div class="toolbar">
+        <h2 style="margin:0">Immagine</h2>
+        <span class="stats" id="pickInfo"></span>
+        <button id="clearPicks">Cancella punti</button>
+      </div>
+      <div class="stage" id="stage">
+        <img id="img" alt="Immagine caricata">
+        <svg id="overlay"></svg>
+      </div>
+    </div>
+
+    <div class="panel hidden" id="resultPanel">
+      <div class="toolbar">
+        <h2 style="margin:0">Anteprima DXF</h2>
+        <button id="download">Scarica DXF</button>
+        <button id="fit">Adatta</button>
+        <span id="coords"></span>
+      </div>
+      <p class="stats" id="stats"></p>
+      <svg id="preview"></svg>
+      <p class="hint">Rotella: zoom · trascina: sposta · clicca due punti per misurare una distanza (aggancio ai vertici e ai centri dei cerchi; poi puoi usarla per la calibrazione).</p>
+      <p class="stats" id="measure"></p>
+    </div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const SVGNS = "http://www.w3.org/2000/svg";
+let file = null, isPdf = false, picks = [], result = null, measurePts = [];
+let calFactor = 1; // calibration already applied to the current result
+
+// ---------------------------------------------------------------- file input
+const drop = $("drop");
+drop.onclick = () => $("file").click();
+$("file").onchange = (e) => e.target.files[0] && setFile(e.target.files[0]);
+drop.ondragover = (e) => { e.preventDefault(); drop.classList.add("over"); };
+drop.ondragleave = () => drop.classList.remove("over");
+drop.ondrop = (e) => {
+  e.preventDefault(); drop.classList.remove("over");
+  if (e.dataTransfer.files[0]) setFile(e.dataTransfer.files[0]);
+};
+
+function setFile(f) {
+  file = f;
+  isPdf = /\.pdf$/i.test(f.name);
+  $("dropText").innerHTML = `<strong></strong><br>clicca per cambiare file`;
+  $("dropText").querySelector("strong").textContent = f.name;
+  $("pdfBox").classList.toggle("hidden", !isPdf);
+  $("imgBox").classList.toggle("hidden", isPdf);
+  $("commonBox").classList.remove("hidden");
+  $("convert").disabled = false;
+  $("resultPanel").classList.add("hidden");
+  hideError();
+  picks = [];
+  if (!isPdf) {
+    const img = $("img");
+    img.onload = () => { layoutOverlay(); updatePickUI(); };
+    img.src = URL.createObjectURL(f);
+    $("imagePanel").classList.remove("hidden");
+  } else {
+    $("imagePanel").classList.add("hidden");
+  }
+  updateVecBox();
+}
+
+// ------------------------------------------------------------ option panels
+$("method").onchange = () => {
+  document.querySelectorAll("[data-method]").forEach((el) =>
+    el.classList.toggle("hidden", el.dataset.method !== $("method").value));
+  picks = []; updatePickUI(); updateVecBox();
+};
+$("sheet").onchange = () => $("customSheetBox").classList.toggle("hidden", $("sheet").value !== "custom");
+$("manualCorners").onchange = () => { picks = []; updatePickUI(); };
+$("raster").onchange = updateVecBox;
+
+function updateVecBox() {
+  const show = file && (!isPdf || $("raster").checked);
+  $("vecBox").classList.toggle("hidden", !show);
+}
+
+function pickTarget() {
+  if (isPdf || !file) return 0;
+  const m = $("method").value;
+  if (m === "ref") return 2;
+  if (m === "sheet" && $("manualCorners").checked) return 4;
+  return 0;
+}
+
+// ----------------------------------------------------- clicks on the image
+const overlay = $("overlay");
+function layoutOverlay() {
+  const img = $("img");
+  overlay.setAttribute("viewBox", `0 0 ${img.naturalWidth} ${img.naturalHeight}`);
+  overlay.setAttribute("preserveAspectRatio", "none");
+}
+overlay.addEventListener("click", (e) => {
+  const need = pickTarget();
+  if (!need) return;
+  const img = $("img"), r = overlay.getBoundingClientRect();
+  const x = (e.clientX - r.left) * img.naturalWidth / r.width;
+  const y = (e.clientY - r.top) * img.naturalHeight / r.height;
+  if (picks.length >= need) picks = [];
+  picks.push([x, y]);
+  updatePickUI();
+});
+$("clearPicks").onclick = () => { picks = []; updatePickUI(); };
+
+function updatePickUI() {
+  const need = pickTarget();
+  const img = $("img");
+  overlay.innerHTML = "";
+  const s = Math.max(img.naturalWidth, img.naturalHeight) / 150 || 4;
+  if (picks.length > 1) {
+    const pl = document.createElementNS(SVGNS, "polyline");
+    const pts = need === 4 && picks.length === 4 ? [...picks, picks[0]] : picks;
+    pl.setAttribute("points", pts.map((p) => p.join(",")).join(" "));
+    pl.setAttribute("fill", "none");
+    pl.setAttribute("stroke", "var(--pick)");
+    pl.setAttribute("stroke-width", s / 3);
+    overlay.appendChild(pl);
+  }
+  picks.forEach((p, i) => {
+    const c = document.createElementNS(SVGNS, "circle");
+    c.setAttribute("cx", p[0]); c.setAttribute("cy", p[1]); c.setAttribute("r", s);
+    c.setAttribute("fill", "none"); c.setAttribute("stroke", "var(--pick)"); c.setAttribute("stroke-width", s / 3);
+    overlay.appendChild(c);
+    const t = document.createElementNS(SVGNS, "text");
+    t.setAttribute("x", p[0] + s * 1.3); t.setAttribute("y", p[1] - s * 1.3);
+    t.setAttribute("font-size", s * 3); t.setAttribute("fill", "var(--pick)");
+    t.textContent = i + 1;
+    overlay.appendChild(t);
+  });
+  $("clearPicks").classList.toggle("hidden", !need);
+  $("pickInfo").textContent = !need ? "" :
+    need === 2 ? `Clicca 2 punti a distanza nota (${picks.length}/2)` :
+    `Clicca i 4 angoli del foglio in ordine (${picks.length}/4)`;
+  overlay.style.cursor = need ? "crosshair" : "default";
+}
+
+// ------------------------------------------------------------------ convert
+function collectOptions() {
+  const o = {};
+  const num = (id) => $(id).value.trim();
+  o.scale = num("scale") || 1;
+  if (num("tolerance")) o.tolerance = num("tolerance");
+  if (num("calMeasured") || num("calReal")) {
+    if (!(num("calMeasured") && num("calReal"))) throw new Error("Calibrazione: indicare sia la misura letta sia quella reale.");
+    o.calibrate = `${num("calMeasured")},${num("calReal")}`;
+  }
+  if (isPdf) {
+    o.page = num("page") || 1;
+    o.raster = $("raster").checked;
+    o.raster_dpi = num("rasterDpi") || 600;
+    o.no_circles = $("noCircles").checked;
+  } else {
+    const m = $("method").value;
+    if (m === "sheet") {
+      if ($("sheet").value === "custom") {
+        if (!num("customSheet")) throw new Error("Indica le dimensioni del foglio, es. 300x200.");
+        o.sheet = num("customSheet");
+      } else o.sheet = $("sheet").value;
+      if ($("manualCorners").checked) {
+        if (picks.length !== 4) throw new Error("Clicca i 4 angoli del foglio sull'immagine.");
+        o.corners = picks.map((p) => p.map((v) => v.toFixed(1)).join(",")).join(";");
+      }
+    } else if (m === "ref") {
+      if (picks.length !== 2) throw new Error("Clicca 2 punti sull'immagine.");
+      if (!num("refLength")) throw new Error("Indica la distanza reale fra i due punti.");
+      o.ref = picks.flat().map((v) => v.toFixed(1)).join(",");
+      o.ref_length = num("refLength");
+    } else if (m === "dpi") {
+      if (num("dpi")) o.dpi = num("dpi");
+    } else if (m === "pxmm") {
+      if (!num("pxmm")) throw new Error("Indica i pixel per millimetro.");
+      o.px_per_mm = num("pxmm");
+    }
+  }
+  if (!isPdf || $("raster").checked) {
+    o.mode = $("mode").value;
+    if ($("threshold").value) o.threshold = $("threshold").value;
+    o.min_length = num("minLength") || 0;
+    o.invert = $("invert").checked;
+  }
+  return o;
+}
+
+$("convert").onclick = async () => {
+  hideError();
+  let options;
+  try { options = collectOptions(); } catch (e) { return showError(e.message); }
+  const btn = $("convert");
+  btn.disabled = true; btn.textContent = "Conversione in corso…";
+  try {
+    const q = new URLSearchParams({ filename: file.name, options: JSON.stringify(options) });
+    const res = await fetch("/api/convert?" + q, { method: "POST", body: file });
+    const data = await res.json();
+    if (!data.ok) throw new Error(data.error || "Errore sconosciuto");
+    result = data;
+    calFactor = options.calibrate ?
+      Number(options.calibrate.split(",")[1]) / Number(options.calibrate.split(",")[0]) : 1;
+    showResult();
+  } catch (e) {
+    showError(e.message.includes("fetch") ?
+      "Server non raggiungibile: avvia 'python -m dxfconv.web' e apri la pagina da lì." : e.message);
+  } finally {
+    btn.disabled = false; btn.textContent = "Converti in DXF";
+  }
+};
+
+function showError(msg) { $("error").textContent = msg; $("error").classList.remove("hidden"); }
+function hideError() { $("error").classList.add("hidden"); }
+
+$("download").onclick = () => {
+  const blob = new Blob([result.dxf], { type: "application/dxf" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = file.name.replace(/\.[^.]+$/, "") + ".dxf";
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+};
+
+// ------------------------------------------------------------------ preview
+const preview = $("preview");
+let view = null; // {x, y, w, h} in SVG space (mm, Y flipped)
+
+function showResult() {
+  const [x0, y0, x1, y1] = result.bounds;
+  const f = (v) => v.toLocaleString("it-IT", { maximumFractionDigits: 2 });
+  $("stats").innerHTML =
+    `Metodo: <b></b> · ${result.polylines.length} polilinee/linee, ${result.circles.length} cerchi · ` +
+    `Ingombro: <b>${f(x1 - x0)} × ${f(y1 - y0)} mm</b>`;
+  $("stats").querySelector("b").textContent = result.method;
+  $("resultPanel").classList.remove("hidden");
+  measurePts = []; $("measure").textContent = "";
+  drawPreview();
+  fit();
+}
+
+function drawPreview() {
+  preview.innerHTML = "";
+  const [x0, y0, x1, y1] = result.bounds;
+  const g = document.createElementNS(SVGNS, "g");
+  g.setAttribute("transform", "scale(1,-1)");
+  g.setAttribute("id", "geom");
+
+  // 10 mm grid
+  const grid = document.createElementNS(SVGNS, "path");
+  let d = "";
+  const gx0 = Math.floor(x0 / 10) * 10 - 10, gx1 = Math.ceil(x1 / 10) * 10 + 10;
+  const gy0 = Math.floor(y0 / 10) * 10 - 10, gy1 = Math.ceil(y1 / 10) * 10 + 10;
+  if ((gx1 - gx0) / 10 + (gy1 - gy0) / 10 < 800) {
+    for (let x = gx0; x <= gx1; x += 10) d += `M${x} ${gy0}V${gy1}`;
+    for (let y = gy0; y <= gy1; y += 10) d += `M${gx0} ${y}H${gx1}`;
+  }
+  grid.setAttribute("d", d);
+  grid.setAttribute("stroke", "var(--grid)");
+  grid.setAttribute("vector-effect", "non-scaling-stroke");
+  g.appendChild(grid);
+
+  const geo = document.createElementNS(SVGNS, "path");
+  geo.setAttribute("d", result.polylines.map((p) =>
+    "M" + p.points.map((q) => q.join(" ")).join("L") + (p.closed ? "Z" : "")).join(""));
+  geo.setAttribute("fill", "none");
+  geo.setAttribute("stroke", "var(--draw)");
+  geo.setAttribute("stroke-width", "1.2");
+  geo.setAttribute("vector-effect", "non-scaling-stroke");
+  g.appendChild(geo);
+
+  for (const c of result.circles) {
+    const el = document.createElementNS(SVGNS, "circle");
+    el.setAttribute("cx", c.center[0]); el.setAttribute("cy", c.center[1]); el.setAttribute("r", c.radius);
+    el.setAttribute("fill", "none"); el.setAttribute("stroke", "var(--circle)");
+    el.setAttribute("stroke-width", "1.2"); el.setAttribute("vector-effect", "non-scaling-stroke");
+    g.appendChild(el);
+  }
+
+  const m = document.createElementNS(SVGNS, "g");
+  m.setAttribute("id", "measureLayer");
+  g.appendChild(m);
+  preview.appendChild(g);
+}
+
+function fit() {
+  const [x0, y0, x1, y1] = result.bounds;
+  const pad = Math.max(x1 - x0, y1 - y0) * 0.05 + 1;
+  view = { x: x0 - pad, y: -y1 - pad, w: x1 - x0 + 2 * pad, h: y1 - y0 + 2 * pad };
+  applyView();
+}
+$("fit").onclick = fit;
+
+function applyView() {
+  preview.setAttribute("viewBox", `${view.x} ${view.y} ${view.w} ${view.h}`);
+}
+
+function toMm(e) {
+  const pt = preview.createSVGPoint();
+  pt.x = e.clientX; pt.y = e.clientY;
+  const p = pt.matrixTransform(preview.getScreenCTM().inverse());
+  return [p.x, -p.y];
+}
+
+preview.addEventListener("wheel", (e) => {
+  if (!view) return;
+  e.preventDefault();
+  const [mx, my] = toMm(e);
+  const k = e.deltaY > 0 ? 1.2 : 1 / 1.2;
+  const sy = -my;
+  view = { x: mx - (mx - view.x) * k, y: sy - (sy - view.y) * k, w: view.w * k, h: view.h * k };
+  applyView();
+}, { passive: false });
+
+let drag = null;
+preview.addEventListener("pointerdown", (e) => {
+  if (!view) return;
+  drag = { x: e.clientX, y: e.clientY, view: { ...view }, moved: false };
+  preview.setPointerCapture(e.pointerId);
+});
+preview.addEventListener("pointermove", (e) => {
+  if (!view) return;
+  const [x, y] = toMm(e);
+  $("coords").textContent = `X ${x.toFixed(2)}  Y ${y.toFixed(2)} mm`;
+  if (!drag) return;
+  const r = preview.getBoundingClientRect();
+  const s = Math.max(drag.view.w / r.width, drag.view.h / r.height);
+  const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+  if (Math.abs(dx) + Math.abs(dy) > 3) drag.moved = true;
+  view = { ...drag.view, x: drag.view.x - dx * s, y: drag.view.y - dy * s };
+  applyView();
+});
+preview.addEventListener("pointerup", (e) => {
+  if (drag && !drag.moved) addMeasurePoint(toMm(e));
+  drag = null;
+});
+
+// Snap to the nearest vertex or circle centre within 10 screen pixels.
+function snap(p) {
+  const r = preview.getBoundingClientRect();
+  const limit = 10 * Math.max(view.w / r.width, view.h / r.height);
+  let best = null, bestD = limit;
+  const test = (q) => {
+    const d = Math.hypot(q[0] - p[0], q[1] - p[1]);
+    if (d < bestD) { bestD = d; best = q; }
+  };
+  result.polylines.forEach((pl) => pl.points.forEach(test));
+  result.circles.forEach((c) => test(c.center));
+  return best || p;
+}
+
+function addMeasurePoint(p) {
+  p = snap(p);
+  if (measurePts.length >= 2) measurePts = [];
+  measurePts.push(p);
+  const layer = $("measureLayer");
+  layer.innerHTML = "";
+  const r = view.w / 150;
+  measurePts.forEach((q) => {
+    const c = document.createElementNS(SVGNS, "circle");
+    c.setAttribute("cx", q[0]); c.setAttribute("cy", q[1]); c.setAttribute("r", r);
+    c.setAttribute("fill", "var(--pick)");
+    layer.appendChild(c);
+  });
+  if (measurePts.length === 2) {
+    const [a, b] = measurePts;
+    const l = document.createElementNS(SVGNS, "line");
+    l.setAttribute("x1", a[0]); l.setAttribute("y1", a[1]); l.setAttribute("x2", b[0]); l.setAttribute("y2", b[1]);
+    l.setAttribute("stroke", "var(--pick)"); l.setAttribute("stroke-width", "1.5");
+    l.setAttribute("vector-effect", "non-scaling-stroke");
+    layer.appendChild(l);
+    const dist = Math.hypot(b[0] - a[0], b[1] - a[1]);
+    const el = $("measure");
+    el.innerHTML = `Distanza misurata: <b>${dist.toFixed(2)} mm</b> `;
+    const use = document.createElement("button");
+    use.textContent = "Usa per calibrare";
+    // The new calibration replaces the old one: undo the factor already applied.
+    use.onclick = () => { $("calMeasured").value = (dist / calFactor).toFixed(3); $("calReal").focus(); };
+    el.appendChild(use);
+  } else {
+    $("measure").textContent = "Clicca il secondo punto…";
+  }
+}
+</script>
+</body>
+</html>

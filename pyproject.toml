@@ -21,6 +21,10 @@ test = ["pytest"]
 
 [project.scripts]
 dxfconv = "dxfconv.cli:main"
+dxfconv-web = "dxfconv.web:main"
 
 [tool.setuptools]
 packages = ["dxfconv"]
+
+[tool.setuptools.package-data]
+dxfconv = ["static/*.html"]

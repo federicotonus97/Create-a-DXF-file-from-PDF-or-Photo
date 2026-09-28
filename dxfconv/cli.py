@@ -8,6 +8,7 @@ import sys
 
 from . import __version__
 from .dxf_writer import write_dxf_r12
+from .geometry import Drawing
 from .image_source import (
     PAPER_SIZES_MM,
     ImageOptions,
@@ -149,6 +150,22 @@ def run(argv: list[str] | None = None) -> int:
         raise SystemExit(f"Errore: file non trovato: {src}")
     out = args.output or os.path.splitext(src)[0] + ".dxf"
 
+    drawing, method = convert(args)
+    write_dxf_r12(drawing, out)
+    xmin, ymin, xmax, ymax = drawing.bounds()
+    print(f"Metodo: {method}")
+    print(f"Entità: {len(drawing.polylines)} polilinee/linee, {len(drawing.circles)} cerchi")
+    print(f"Ingombro: {xmax - xmin:.2f} x {ymax - ymin:.2f} mm")
+    print(f"Salvato: {out} (DXF R12, unità mm, scala 1:1)")
+    return 0
+
+
+def convert(args: argparse.Namespace) -> tuple[Drawing, str]:
+    """Convert ``args.input`` according to parsed CLI ``args``.
+
+    Returns the 1:1 drawing (mm) and a description of the scale method.
+    """
+    src = args.input
     img_opts = ImageOptions(
         mode=args.mode,
         threshold=args.threshold or ("adaptive" if args.sheet else "otsu"),
@@ -182,14 +199,7 @@ def run(argv: list[str] | None = None) -> int:
 
     if drawing.is_empty():
         raise SystemExit("Errore: nessuna geometria trovata nell'input")
-
-    write_dxf_r12(drawing, out)
-    xmin, ymin, xmax, ymax = drawing.bounds()
-    print(f"Metodo: {method}")
-    print(f"Entità: {len(drawing.polylines)} polilinee/linee, {len(drawing.circles)} cerchi")
-    print(f"Ingombro: {xmax - xmin:.2f} x {ymax - ymin:.2f} mm")
-    print(f"Salvato: {out} (DXF R12, unità mm, scala 1:1)")
-    return 0
+    return drawing, method
 
 
 def _convert_image(src: str, args, opts: ImageOptions):
