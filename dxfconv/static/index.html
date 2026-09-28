@@ -69,14 +69,13 @@
 <body>
 <header>
   <h1>dxfconv – da PDF o foto a DXF R12 in scala 1:1</h1>
-  <p>Unità: millimetri. Carica un file, scegli come ricavare la scala, converti e scarica il DXF.</p>
+  <p>Unità: millimetri. Carica un file, scegli come ricavare la scala, converti e scarica il DXF. Tutto avviene nel browser: i file non vengono inviati a nessuno.</p>
 </header>
 
-<div class="error hidden" id="serverBanner" style="margin:16px 16px 0"></div>
 <main>
   <section class="panel">
     <div class="drop" id="drop">
-      <input type="file" id="file" accept=".pdf,.png,.jpg,.jpeg,.tif,.tiff,.bmp,.webp" hidden>
+      <input type="file" id="file" accept=".pdf,.png,.jpg,.jpeg,.bmp,.webp,.gif" hidden>
       <div id="dropText">Trascina qui un <strong>PDF</strong> o una <strong>foto</strong><br>oppure clicca per sceglierlo</div>
     </div>
 
@@ -88,7 +87,7 @@
       </div>
       <label class="inline"><input type="checkbox" id="raster"> Forza vettorizzazione raster (PDF scansionato)</label>
       <label class="inline"><input type="checkbox" id="noCircles"> Non riconoscere i cerchi</label>
-      <p class="hint">I PDF vettoriali vengono convertiti in modo esatto. I PDF scansionati vengono vettorizzati automaticamente.</p>
+      <p class="hint">I PDF vettoriali vengono convertiti in modo esatto. I PDF scansionati vengono vettorizzati automaticamente. Per leggere i PDF la pagina scarica la libreria PDF.js (serve internet).</p>
     </fieldset>
 
     <fieldset id="imgBox" class="hidden">
@@ -198,6 +197,860 @@
     </div>
   </section>
 </main>
+
+<script>
+/* ==========================================================================
+   dxfconv engine: in-browser port of the Python package (dxfconv/*.py).
+   Everything runs locally; only PDF.js is fetched from the CDN for PDFs.
+   Units: millimetres, Y axis up, output DXF R12 (AC1009) at 1:1 scale.
+   ========================================================================== */
+const DXF = (() => {
+  const PT_TO_MM = 25.4 / 72;
+  const MAX_PIXELS = 16e6; // working image size cap (memory / speed)
+  const PDFJS = "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/";
+  const PAPER = {
+    A0: [841, 1189], A1: [594, 841], A2: [420, 594], A3: [297, 420],
+    A4: [210, 297], A5: [148, 210], LETTER: [215.9, 279.4], LEGAL: [215.9, 355.6],
+  };
+  const tick = () => new Promise((r) => setTimeout(r, 0));
+
+  function nums(text, n, name) {
+    const v = String(text).replace(/[;xX]/g, ",").split(",").filter((s) => s.trim()).map(Number);
+    if (v.length !== n || v.some((x) => !isFinite(x))) throw new Error(`${name} richiede ${n} numeri, ricevuto '${text}'`);
+    return v;
+  }
+
+  // ------------------------------------------------------------ raster basics
+  // A gray image is {w, h, d: Uint8Array}.
+  function blur(g, k) {
+    const ker = k === 5 ? [1, 4, 6, 4, 1] : [1, 2, 1];
+    const r = ker.length >> 1, sum = ker.reduce((a, b) => a + b);
+    const { w, h, d } = g, tmp = new Float32Array(w * h), out = new Uint8Array(w * h);
+    for (let y = 0; y < h; y++)
+      for (let x = 0; x < w; x++) {
+        let s = 0;
+        for (let i = -r; i <= r; i++) s += ker[i + r] * d[y * w + Math.min(w - 1, Math.max(0, x + i))];
+        tmp[y * w + x] = s / sum;
+      }
+    for (let y = 0; y < h; y++)
+      for (let x = 0; x < w; x++) {
+        let s = 0;
+        for (let i = -r; i <= r; i++) s += ker[i + r] * tmp[Math.min(h - 1, Math.max(0, y + i)) * w + x];
+        out[y * w + x] = Math.round(s / sum);
+      }
+    return { w, h, d: out };
+  }
+
+  function otsu(d) {
+    const hist = new Float64Array(256);
+    for (let i = 0; i < d.length; i++) hist[d[i]]++;
+    let total = d.length, sumAll = 0;
+    for (let i = 0; i < 256; i++) sumAll += i * hist[i];
+    let wB = 0, sumB = 0, best = 0, t = 127;
+    for (let i = 0; i < 256; i++) {
+      wB += hist[i];
+      if (!wB) continue;
+      const wF = total - wB;
+      if (!wF) break;
+      sumB += i * hist[i];
+      const mB = sumB / wB, mF = (sumAll - sumB) / wF;
+      const between = wB * wF * (mB - mF) * (mB - mF);
+      if (between > best) { best = between; t = i; }
+    }
+    return t;
+  }
+
+  function erodeDilate(m, w, h, dilate) {
+    const out = new Uint8Array(w * h);
+    for (let y = 0; y < h; y++)
+      for (let x = 0; x < w; x++) {
+        let v = dilate ? 0 : 1;
+        for (let dy = -1; dy <= 1 && v === (dilate ? 0 : 1); dy++)
+          for (let dx = -1; dx <= 1; dx++) {
+            const yy = y + dy, xx = x + dx;
+            const p = yy < 0 || yy >= h || xx < 0 || xx >= w ? 0 : m[yy * w + xx];
+            if (dilate && p) { v = 1; break; }
+            if (!dilate && !p) { v = 0; break; }
+          }
+        out[y * w + x] = v;
+      }
+    return out;
+  }
+
+  /** Binary mask (1 = stroke) like cv2 threshold + open + close. */
+  function binarize(g, method, invert) {
+    const b = blur(g, 3), { w, h, d } = b, m = new Uint8Array(w * h);
+    if (method === "adaptive") {
+      const block = Math.max(15, Math.floor(Math.min(w, h) / 40) | 1), r = block >> 1;
+      const integ = new Float64Array((w + 1) * (h + 1));
+      for (let y = 0; y < h; y++) {
+        let row = 0;
+        for (let x = 0; x < w; x++) {
+          row += d[y * w + x];
+          integ[(y + 1) * (w + 1) + x + 1] = integ[y * (w + 1) + x + 1] + row;
+        }
+      }
+      for (let y = 0; y < h; y++)
+        for (let x = 0; x < w; x++) {
+          const x0 = Math.max(0, x - r), x1 = Math.min(w, x + r + 1);
+          const y0 = Math.max(0, y - r), y1 = Math.min(h, y + r + 1);
+          const s = integ[y1 * (w + 1) + x1] - integ[y0 * (w + 1) + x1] - integ[y1 * (w + 1) + x0] + integ[y0 * (w + 1) + x0];
+          const mean = s / ((x1 - x0) * (y1 - y0));
+          const v = d[y * w + x];
+          m[y * w + x] = invert ? (v > mean + 10 ? 1 : 0) : (v <= mean - 10 ? 1 : 0);
+        }
+    } else {
+      const t = otsu(d);
+      for (let i = 0; i < d.length; i++) m[i] = invert ? (d[i] > t ? 1 : 0) : (d[i] <= t ? 1 : 0);
+    }
+    let r = erodeDilate(erodeDilate(m, w, h, false), w, h, true); // open
+    r = erodeDilate(erodeDilate(r, w, h, true), w, h, false); // close
+    return r;
+  }
+
+  // ------------------------------------------------------------ skeleton
+  /** Zhang-Suen thinning in place; mask border is cleared first. */
+  function thin(m, w, h) {
+    for (let x = 0; x < w; x++) { m[x] = 0; m[(h - 1) * w + x] = 0; }
+    for (let y = 0; y < h; y++) { m[y * w] = 0; m[y * w + w - 1] = 0; }
+    let pts = [];
+    for (let i = 0; i < m.length; i++) if (m[i]) pts.push(i);
+    const N = [-w, -w + 1, 1, w + 1, w, w - 1, -1, -w - 1]; // P2..P9
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (let step = 0; step < 2; step++) {
+        const rm = [];
+        for (const i of pts) {
+          if (!m[i]) continue;
+          const p = N.map((o) => m[i + o]);
+          const b = p.reduce((a, c) => a + c, 0);
+          if (b < 2 || b > 6) continue;
+          let a = 0;
+          for (let k = 0; k < 8; k++) if (!p[k] && p[(k + 1) % 8]) a++;
+          if (a !== 1) continue;
+          const [p2, , p4, , p6, , p8] = p;
+          if (step === 0 ? (p2 && p4 && p6) || (p4 && p6 && p8) : (p2 && p4 && p8) || (p2 && p6 && p8)) continue;
+          rm.push(i);
+        }
+        for (const i of rm) m[i] = 0;
+        if (rm.length) changed = true;
+      }
+      pts = pts.filter((i) => m[i]);
+    }
+    // Remove staircase corners (L of three pixels) so strokes are not fragmented.
+    for (;;) {
+      const cand = new Set();
+      for (const i of pts) {
+        if (!m[i]) continue;
+        let b = 0;
+        for (const o of N) b += m[i + o];
+        if (b !== 2) continue;
+        const n2 = m[i - w], n4 = m[i + 1], n6 = m[i + w], n8 = m[i - 1];
+        if ((n2 && n4) || (n4 && n6) || (n6 && n8) || (n8 && n2)) cand.add(i);
+      }
+      const rm = [...cand].filter((i) => !N.some((o) => cand.has(i + o)));
+      if (!rm.length) break;
+      for (const i of rm) m[i] = 0;
+      pts = pts.filter((i) => m[i]);
+    }
+    return m;
+  }
+
+  /** Split a skeleton into pixel-index paths: [{path, closed}]. */
+  function traceSkeleton(sk, w, h, spurPx) {
+    const OFF = [-w, 1, w, -1, -w + 1, w + 1, w - 1, -w - 1]; // 4-neighbours first
+    const n = w * h, deg = new Uint8Array(n);
+    const pix = [];
+    for (let i = 0; i < n; i++)
+      if (sk[i]) {
+        pix.push(i);
+        let c = 0;
+        for (const o of OFF) c += sk[i + o];
+        deg[i] = c;
+      }
+    // Label clusters of node pixels (degree != 2).
+    const label = new Int32Array(n);
+    let nl = 0;
+    for (const i of pix) {
+      if (deg[i] === 2 || label[i]) continue;
+      label[i] = ++nl;
+      const stack = [i];
+      while (stack.length) {
+        const p = stack.pop();
+        for (const o of OFF) {
+          const q = p + o;
+          if (sk[q] && deg[q] !== 2 && !label[q]) { label[q] = nl; stack.push(q); }
+        }
+      }
+    }
+    const visited = new Uint8Array(n);
+    const walk = (start, first) => {
+      const path = [start, first];
+      visited[first] = 1;
+      let prev = start, cur = first;
+      for (;;) {
+        let nxt = -1;
+        for (const o of OFF) {
+          const q = cur + o;
+          if (!sk[q] || q === prev || (q === start && path.length < 3)) continue;
+          if (label[q] || !visited[q]) { nxt = q; break; }
+        }
+        if (nxt < 0) return path;
+        path.push(nxt);
+        if (label[nxt]) return path;
+        visited[nxt] = 1;
+        prev = cur; cur = nxt;
+      }
+    };
+    let edges = [];
+    for (const i of pix) {
+      if (!label[i]) continue;
+      for (const o of OFF) {
+        const q = i + o;
+        if (sk[q] && !label[q] && !visited[q]) {
+          const path = walk(i, q);
+          edges.push([path, label[i], label[path[path.length - 1]] || -1]);
+        }
+      }
+    }
+    const loops = [];
+    for (const i of pix) {
+      if (label[i] || visited[i]) continue;
+      visited[i] = 1;
+      const q = i + OFF.find((o) => sk[i + o]);
+      loops.push({ path: walk(i, q), closed: true });
+    }
+    // Drop short spurs (free end on one side, junction on the other).
+    if (spurPx > 0)
+      for (let it = 0; it < 2; it++) {
+        const count = new Map();
+        for (const e of edges) for (const l of [e[1], e[2]]) count.set(l, (count.get(l) || 0) + 1);
+        const kept = edges.filter((e) => {
+          const ca = count.get(e[1]) || 0, cb = count.get(e[2]) || 0;
+          const spur = (ca === 1 && cb >= 3) || (cb === 1 && ca >= 3);
+          return !(spur && e[0].length < spurPx);
+        });
+        if (kept.length === edges.length) break;
+        edges = kept;
+      }
+    // Join branches through clusters touched by exactly two branch ends.
+    const incident = new Map();
+    edges.forEach((e, i) => {
+      for (const l of [e[1], e[2]]) {
+        if (!incident.has(l)) incident.set(l, []);
+        incident.get(l).push(i);
+      }
+    });
+    const alive = edges.map(() => true), closed = edges.map(() => false);
+    for (const lab of [...incident.keys()]) {
+      const ids = incident.get(lab).filter((i) => alive[i]);
+      if (lab === -1 || ids.length !== 2) continue;
+      const [i, j] = ids;
+      if (i === j) { closed[i] = true; continue; }
+      let [pi, ai, bi] = edges[i];
+      let [pj, aj, bj] = edges[j];
+      if (bi !== lab) { pi = pi.slice().reverse(); [ai, bi] = [bi, ai]; }
+      if (aj !== lab) { pj = pj.slice().reverse(); [aj, bj] = [bj, aj]; }
+      edges[i] = [pi.concat(pj), ai, bj];
+      alive[j] = false;
+      incident.set(bj, (incident.get(bj) || []).map((k) => (k === j ? i : k)));
+      if (ai === bj) closed[i] = true;
+    }
+    const out = [];
+    edges.forEach((e, i) => { if (alive[i]) out.push({ path: e[0], closed: closed[i] }); });
+    return out.concat(loops);
+  }
+
+  /** Boundaries of stroke regions (outer and holes), pixel-corner coords. */
+  function traceContours(m, w, h) {
+    const W1 = w + 1, starts = new Map(), E = [];
+    const add = (x0, y0, x1, y1) => {
+      const k = y0 * W1 + x0;
+      E.push([x0, y0, x1, y1]);
+      if (!starts.has(k)) starts.set(k, []);
+      starts.get(k).push(E.length - 1);
+    };
+    const ink = (x, y) => x >= 0 && y >= 0 && x < w && y < h && m[y * w + x];
+    for (let y = 0; y < h; y++)
+      for (let x = 0; x < w; x++) {
+        if (!m[y * w + x]) continue;
+        if (!ink(x, y - 1)) add(x, y, x + 1, y);
+        if (!ink(x + 1, y)) add(x + 1, y, x + 1, y + 1);
+        if (!ink(x, y + 1)) add(x + 1, y + 1, x, y + 1);
+        if (!ink(x - 1, y)) add(x, y + 1, x, y);
+      }
+    const used = new Uint8Array(E.length), loops = [];
+    for (let s = 0; s < E.length; s++) {
+      if (used[s]) continue;
+      const pts = [];
+      let e = s;
+      while (e >= 0 && !used[e]) {
+        used[e] = 1;
+        pts.push([E[e][0], E[e][1]]);
+        const list = starts.get(E[e][3] * W1 + E[e][2]) || [];
+        e = list.find((k) => !used[k]) ?? -1;
+      }
+      loops.push(pts);
+    }
+    return loops;
+  }
+
+  // ------------------------------------------------------------ polylines
+  function dpOpen(pts, eps) {
+    if (pts.length < 3) return pts.slice();
+    const keep = new Uint8Array(pts.length);
+    keep[0] = keep[pts.length - 1] = 1;
+    const stack = [[0, pts.length - 1]];
+    while (stack.length) {
+      const [a, b] = stack.pop();
+      const [ax, ay] = pts[a], [bx, by] = pts[b];
+      const dx = bx - ax, dy = by - ay, len = Math.hypot(dx, dy);
+      let best = -1, bi = -1;
+      for (let i = a + 1; i < b; i++) {
+        const [px, py] = pts[i];
+        const d = len ? Math.abs(dx * (ay - py) - dy * (ax - px)) / len : Math.hypot(px - ax, py - ay);
+        if (d > best) { best = d; bi = i; }
+      }
+      if (best > eps) { keep[bi] = 1; stack.push([a, bi], [bi, b]); }
+    }
+    return pts.filter((_, i) => keep[i]);
+  }
+
+  function dpClosed(pts, eps) {
+    if (pts.length < 4) return pts.slice();
+    let far = 0, best = -1;
+    pts.forEach((p, i) => {
+      const d = Math.hypot(p[0] - pts[0][0], p[1] - pts[0][1]);
+      if (d > best) { best = d; far = i; }
+    });
+    const a = dpOpen(pts.slice(0, far + 1), eps);
+    const b = dpOpen(pts.slice(far).concat([pts[0]]), eps);
+    return a.concat(b.slice(1, -1));
+  }
+
+  function dropShort(pts, minLen, closed) {
+    if (pts.length <= 2) return pts;
+    const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
+    const out = [pts[0]];
+    for (const p of pts.slice(1, -1)) if (dist(out[out.length - 1], p) >= minLen) out.push(p);
+    const last = pts[pts.length - 1];
+    if (out.length > 1 && dist(out[out.length - 1], last) < minLen) out.pop();
+    out.push(last);
+    if (closed && out.length > 3 && dist(out[0], out[out.length - 1]) < minLen) out.pop();
+    return out;
+  }
+
+  function pathLength(pts, closed) {
+    let s = 0;
+    for (let i = 1; i < pts.length; i++) s += Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]);
+    if (closed && pts.length > 2) s += Math.hypot(pts[0][0] - pts.at(-1)[0], pts[0][1] - pts.at(-1)[1]);
+    return s;
+  }
+
+  /** Vectorize gray image `g` whose scale is pxPerMm (image_source.vectorize). */
+  async function vectorize(g, pxPerMm, o, progress) {
+    const { w, h } = g;
+    progress("Binarizzazione…"); await tick();
+    const m = binarize(g, o.threshold, o.invert);
+    if (o.margin > 0) {
+      const mg = Math.round(o.margin * pxPerMm);
+      for (let y = 0; y < h; y++)
+        for (let x = 0; x < w; x++)
+          if (x < mg || y < mg || x >= w - mg || y >= h - mg) m[y * w + x] = 0;
+    }
+    const eps = Math.max(0.5, o.tolerance * pxPerMm), mm = 1 / pxPerMm;
+    const raw = [];
+    if (o.mode === "contour") {
+      progress("Contorni…"); await tick();
+      for (const loop of traceContours(m, w, h)) raw.push({ xy: loop, closed: true, corner: true });
+    } else {
+      progress("Scheletro delle linee…"); await tick();
+      thin(m, w, h);
+      progress("Tracciamento…"); await tick();
+      for (const { path, closed } of traceSkeleton(m, w, h, Math.max(3, pxPerMm)))
+        raw.push({ xy: path.map((i) => [i % w, (i / w) | 0]), closed, corner: false });
+    }
+    const polylines = [];
+    for (const { xy, closed, corner } of raw) {
+      if (xy.length < 2) continue;
+      const simple = closed ? dpClosed(xy, eps) : dpOpen(xy, eps);
+      const off = corner ? 0 : 0.5; // pixel centres for skeletons, corners for contours
+      let pts = simple.map(([x, y]) => [(x + off) * mm, (h - (y + off)) * mm]);
+      pts = dropShort(pts, 2 * o.tolerance, closed);
+      if (pts.length < 2 || pathLength(pts, closed) < o.minLength) continue;
+      polylines.push({ points: pts, closed: closed && pts.length > 2 });
+    }
+    return { polylines, circles: [] };
+  }
+
+  // ------------------------------------------------------------ perspective
+  function orderCorners(pts) {
+    const s = pts.map((p) => p[0] + p[1]), d = pts.map((p) => p[1] - p[0]);
+    const arg = (a, f) => a.indexOf(f(...a));
+    return [pts[arg(s, Math.min)], pts[arg(d, Math.min)], pts[arg(s, Math.max)], pts[arg(d, Math.max)]];
+  }
+
+  function solve(A, b) { // Gaussian elimination with partial pivoting
+    const n = b.length;
+    for (let c = 0; c < n; c++) {
+      let p = c;
+      for (let r = c + 1; r < n; r++) if (Math.abs(A[r][c]) > Math.abs(A[p][c])) p = r;
+      [A[c], A[p]] = [A[p], A[c]]; [b[c], b[p]] = [b[p], b[c]];
+      for (let r = c + 1; r < n; r++) {
+        const f = A[r][c] / A[c][c];
+        for (let k = c; k < n; k++) A[r][k] -= f * A[c][k];
+        b[r] -= f * b[c];
+      }
+    }
+    const x = new Array(n);
+    for (let r = n - 1; r >= 0; r--) {
+      let s = b[r];
+      for (let k = r + 1; k < n; k++) s -= A[r][k] * x[k];
+      x[r] = s / A[r][r];
+    }
+    return x;
+  }
+
+  /** Homography mapping points `from` onto points `to` (4 pairs). */
+  function homography(from, to) {
+    const A = [], b = [];
+    for (let i = 0; i < 4; i++) {
+      const [x, y] = from[i], [u, v] = to[i];
+      A.push([x, y, 1, 0, 0, 0, -u * x, -u * y]); b.push(u);
+      A.push([0, 0, 0, x, y, 1, -v * x, -v * y]); b.push(v);
+    }
+    return solve(A, b);
+  }
+
+  function rectify(g, corners, wMm, hMm, pxPerMm) {
+    const src = orderCorners(corners);
+    const top = Math.hypot(src[1][0] - src[0][0], src[1][1] - src[0][1]);
+    const left = Math.hypot(src[3][0] - src[0][0], src[3][1] - src[0][1]);
+    if ((top > left) !== (wMm > hMm)) [wMm, hMm] = [hMm, wMm];
+    const W = Math.round(wMm * pxPerMm), H = Math.round(hMm * pxPerMm);
+    const dst = [[0, 0], [W - 1, 0], [W - 1, H - 1], [0, H - 1]];
+    const M = homography(dst, src); // output pixel -> photo pixel
+    const out = new Uint8Array(W * H), { w, h, d } = g;
+    for (let y = 0; y < H; y++)
+      for (let x = 0; x < W; x++) {
+        const z = M[6] * x + M[7] * y + 1;
+        const sx = (M[0] * x + M[1] * y + M[2]) / z, sy = (M[3] * x + M[4] * y + M[5]) / z;
+        const x0 = Math.floor(sx), y0 = Math.floor(sy);
+        if (x0 < 0 || y0 < 0 || x0 >= w - 1 || y0 >= h - 1) { out[y * W + x] = 255; continue; }
+        const fx = sx - x0, fy = sy - y0, i = y0 * w + x0;
+        out[y * W + x] = Math.round(
+          d[i] * (1 - fx) * (1 - fy) + d[i + 1] * fx * (1 - fy) + d[i + w] * (1 - fx) * fy + d[i + w + 1] * fx * fy);
+      }
+    return { w: W, h: H, d: out };
+  }
+
+  function convexHull(points) {
+    const p = points.slice().sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+    const cross = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+    const lower = [], upper = [];
+    for (const q of p) {
+      while (lower.length >= 2 && cross(lower.at(-2), lower.at(-1), q) <= 0) lower.pop();
+      lower.push(q);
+    }
+    for (const q of p.reverse()) {
+      while (upper.length >= 2 && cross(upper.at(-2), upper.at(-1), q) <= 0) upper.pop();
+      upper.push(q);
+    }
+    return lower.slice(0, -1).concat(upper.slice(0, -1));
+  }
+
+  /** Find the sheet: the largest bright region, reduced to 4 corners. */
+  function detectSheet(g) {
+    const k = Math.min(1, 1200 / Math.max(g.w, g.h));
+    const w = Math.max(1, Math.round(g.w * k)), h = Math.max(1, Math.round(g.h * k));
+    const small = new Uint8Array(w * h);
+    for (let y = 0; y < h; y++)
+      for (let x = 0; x < w; x++)
+        small[y * w + x] = g.d[Math.min(g.h - 1, Math.floor((y + 0.5) / k)) * g.w + Math.min(g.w - 1, Math.floor((x + 0.5) / k))];
+    const b = blur({ w, h, d: small }, 5), t = otsu(b.d);
+    const label = new Int32Array(w * h);
+    let bestLab = 0, bestArea = 0, lab = 0;
+    for (let i = 0; i < w * h; i++) {
+      if (b.d[i] <= t || label[i]) continue;
+      label[i] = ++lab;
+      let area = 0;
+      const stack = [i];
+      while (stack.length) {
+        const p = stack.pop(); area++;
+        const x = p % w, y = (p / w) | 0;
+        for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+          const xx = x + dx, yy = y + dy, q = yy * w + xx;
+          if (xx >= 0 && yy >= 0 && xx < w && yy < h && !label[q] && b.d[q] > t) { label[q] = lab; stack.push(q); }
+        }
+      }
+      if (area > bestArea) { bestArea = area; bestLab = lab; }
+    }
+    if (bestArea < 0.2 * w * h) throw new Error("Foglio non trovato automaticamente: indica i 4 angoli cliccandoli sull'immagine.");
+    const border = [];
+    for (let y = 0; y < h; y++)
+      for (let x = 0; x < w; x++) {
+        if (label[y * w + x] !== bestLab) continue;
+        const inside = (xx, yy) => xx >= 0 && yy >= 0 && xx < w && yy < h && label[yy * w + xx] === bestLab;
+        if (!inside(x - 1, y) || !inside(x + 1, y) || !inside(x, y - 1) || !inside(x, y + 1)) border.push([x + 0.5, y + 0.5]);
+      }
+    const hull = convexHull(border);
+    const peri = pathLength(hull, true);
+    let quad = null;
+    for (let f = 0.005; f <= 0.1 && !quad; f += 0.005) {
+      const s = dpClosed(hull, f * peri);
+      if (s.length === 4) quad = s;
+      else if (s.length < 4) break;
+    }
+    if (!quad) {
+      const sums = hull.map((p) => p[0] + p[1]), diffs = hull.map((p) => p[1] - p[0]);
+      const pick = (a, f) => hull[a.indexOf(f(...a))];
+      quad = [pick(sums, Math.min), pick(diffs, Math.min), pick(sums, Math.max), pick(diffs, Math.max)];
+    }
+    return orderCorners(quad.map(([x, y]) => [x / k, y / k]));
+  }
+
+  // ------------------------------------------------------------ image input
+  async function loadGray(source) {
+    const bmp = await createImageBitmap(source);
+    let w = bmp.width, h = bmp.height, s = 1;
+    if (w * h > MAX_PIXELS) { s = Math.sqrt(MAX_PIXELS / (w * h)); w = Math.round(w * s); h = Math.round(h * s); }
+    const c = document.createElement("canvas");
+    c.width = w; c.height = h;
+    const ctx = c.getContext("2d", { willReadFrequently: true });
+    ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, w, h); // transparent PNG -> white
+    ctx.drawImage(bmp, 0, 0, w, h);
+    const rgba = ctx.getImageData(0, 0, w, h).data, d = new Uint8Array(w * h);
+    for (let i = 0; i < w * h; i++) d[i] = Math.round(0.299 * rgba[4 * i] + 0.587 * rgba[4 * i + 1] + 0.114 * rgba[4 * i + 2]);
+    return { g: { w, h, d }, s, natural: [bmp.width, bmp.height] };
+  }
+
+  /** DPI stored in JPEG (JFIF) or PNG (pHYs) headers, ignoring 72/96 defaults. */
+  async function readDpi(file) {
+    const b = new Uint8Array(await file.slice(0, 65536).arrayBuffer());
+    let dpi = null;
+    if (b[0] === 0xff && b[1] === 0xd8) {
+      for (let i = 2; i + 4 < b.length && b[i] === 0xff;) {
+        const marker = b[i + 1], len = (b[i + 2] << 8) | b[i + 3];
+        if (marker === 0xe0 && String.fromCharCode(...b.slice(i + 4, i + 8)) === "JFIF") {
+          const units = b[i + 11], x = (b[i + 12] << 8) | b[i + 13];
+          if (units === 1) dpi = x; else if (units === 2) dpi = x * 2.54;
+          break;
+        }
+        i += 2 + len;
+      }
+    } else if (b[0] === 0x89 && b[1] === 0x50) {
+      for (let i = 8; i + 8 < b.length;) {
+        const len = ((b[i] << 24) | (b[i + 1] << 16) | (b[i + 2] << 8) | b[i + 3]) >>> 0;
+        const type = String.fromCharCode(...b.slice(i + 4, i + 8));
+        if (type === "pHYs") {
+          const p = i + 8, ppu = ((b[p] << 24) | (b[p + 1] << 16) | (b[p + 2] << 8) | b[p + 3]) >>> 0;
+          if (b[p + 8] === 1) dpi = ppu * 0.0254;
+          break;
+        }
+        if (type === "IDAT") break;
+        i += 12 + len;
+      }
+    }
+    if (!dpi || dpi <= 0 || Math.abs(dpi - 72) < 0.5 || Math.abs(dpi - 96) < 0.5) return null;
+    return Math.round(dpi * 100) / 100;
+  }
+
+  async function convertImage(file, o, progress) {
+    progress("Lettura immagine…");
+    let { g, s } = await loadGray(file);
+    let pxPerMm, method;
+    if (o.sheet) {
+      const key = String(o.sheet).trim().toUpperCase();
+      const [wMm, hMm] = PAPER[key] || nums(o.sheet, 2, "Formato del foglio");
+      let corners, how;
+      if (o.corners) {
+        const v = nums(o.corners, 8, "Angoli");
+        corners = [0, 2, 4, 6].map((i) => [v[i] * s, v[i + 1] * s]);
+        how = "angoli indicati";
+      } else {
+        progress("Ricerca del foglio…"); await tick();
+        corners = detectSheet(g);
+        how = "angoli rilevati";
+      }
+      const res = Math.min(o.resolution, Math.sqrt(MAX_PIXELS / (wMm * hMm)));
+      progress("Correzione prospettica…"); await tick();
+      g = rectify(g, corners, wMm, hMm, res);
+      pxPerMm = res;
+      method = `foto raddrizzata su foglio ${wMm}x${hMm} mm (${how})`;
+    } else if (o.ref || o.ref_length) {
+      if (!(o.ref && o.ref_length)) throw new Error("Servono sia i due punti sia la distanza reale");
+      const [x1, y1, x2, y2] = nums(o.ref, 4, "Punti di riferimento");
+      const d = Math.hypot(x2 - x1, y2 - y1), real = Number(o.ref_length);
+      if (!(d > 0 && real > 0)) throw new Error("Punti di riferimento o lunghezza reale non validi");
+      pxPerMm = (d / real) * s;
+      method = `riferimento ${real} mm (${(d / real).toFixed(3)} px/mm)`;
+    } else if (o.px_per_mm) {
+      pxPerMm = Number(o.px_per_mm) * s;
+      method = `${o.px_per_mm} px/mm`;
+    } else {
+      const dpi = Number(o.dpi) || (await readDpi(file));
+      if (!dpi) throw new Error("Scala dell'immagine sconosciuta: il file non contiene i DPI. Indicali, oppure usa i due punti o il foglio.");
+      pxPerMm = (dpi / 25.4) * s;
+      method = `scansione a ${dpi} dpi`;
+    }
+    if (!(pxPerMm > 0)) throw new Error("La scala px/mm deve essere positiva");
+    return { drawing: await vectorize(g, pxPerMm, o, progress), method };
+  }
+
+  // ------------------------------------------------------------ PDF input
+  let pdfjsPromise = null;
+  function loadPdfJs() {
+    if (!pdfjsPromise)
+      pdfjsPromise = import(PDFJS + "pdf.min.mjs").then((lib) => {
+        lib.GlobalWorkerOptions.workerSrc = PDFJS + "pdf.worker.min.mjs";
+        return lib;
+      }).catch((e) => {
+        pdfjsPromise = null;
+        throw new Error("Impossibile caricare la libreria PDF.js (serve una connessione a internet per i PDF): " + e.message);
+      });
+    return pdfjsPromise;
+  }
+
+  const mul = (m, n) => [ // apply n first, then m
+    m[0] * n[0] + m[2] * n[1], m[1] * n[0] + m[3] * n[1],
+    m[0] * n[2] + m[2] * n[3], m[1] * n[2] + m[3] * n[3],
+    m[0] * n[4] + m[2] * n[5] + m[4], m[1] * n[4] + m[3] * n[5] + m[5]];
+  const apply = (m, x, y) => [m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]];
+
+  function flattenBezier(p0, p1, p2, p3, tol) {
+    const d1 = Math.hypot(p0[0] - 2 * p1[0] + p2[0], p0[1] - 2 * p1[1] + p2[1]);
+    const d2 = Math.hypot(p1[0] - 2 * p2[0] + p3[0], p1[1] - 2 * p2[1] + p3[1]);
+    const mm = 6 * Math.max(d1, d2);
+    const n = Math.max(2, Math.min(256, mm > 0 ? Math.ceil(Math.sqrt(mm / (8 * tol))) : 1));
+    const out = [];
+    for (let i = 1; i <= n; i++) {
+      const t = i / n, u = 1 - t;
+      out.push([0, 1].map((k) => u ** 3 * p0[k] + 3 * u * u * t * p1[k] + 3 * u * t * t * p2[k] + t ** 3 * p3[k]));
+    }
+    return out;
+  }
+
+  function asCircle(pts, tol) {
+    if (pts.length < 8) return null;
+    const cx = pts.reduce((a, p) => a + p[0], 0) / pts.length, cy = pts.reduce((a, p) => a + p[1], 0) / pts.length;
+    const radii = pts.map((p) => Math.hypot(p[0] - cx, p[1] - cy));
+    const r = radii.reduce((a, b) => a + b, 0) / radii.length;
+    if (r <= 0 || Math.max(...radii.map((x) => Math.abs(x - r))) > Math.max(tol, 0.005 * r)) return null;
+    return { center: [cx, cy], radius: r };
+  }
+
+  /** Vector paths of a PDF page -> drawing in mm (pdf_source.extract_vectors). */
+  async function extractVectors(lib, page, tolMm, detectCircles) {
+    const OPS = lib.OPS, vp = page.getViewport({ scale: 1 });
+    const tolPt = tolMm / PT_TO_MM, W = vp.width, H = vp.height;
+    const ops = await page.getOperatorList();
+    const drawing = { polylines: [], circles: [] };
+    const stack = [];
+    let ctm = [1, 0, 0, 1, 0, 0], subpaths = [], cur = null, pos = [0, 0];
+    const dev = (x, y) => apply(mul(vp.transform, ctm), x, y);
+    const newSub = (p, kind) => { cur = { pts: [p], kinds: new Set(kind ? [kind] : []), closed: false }; subpaths.push(cur); };
+    const isFrame = (pts) => {
+      const xs = pts.map((p) => p[0]), ys = pts.map((p) => p[1]);
+      return Math.abs(Math.min(...xs)) < 1 && Math.abs(Math.min(...ys)) < 1 &&
+        Math.abs(Math.max(...xs) - W) < 1 && Math.abs(Math.max(...ys) - H) < 1;
+    };
+    const PAINT = new Set([OPS.stroke, OPS.closeStroke, OPS.fill, OPS.eoFill, OPS.fillStroke,
+      OPS.eoFillStroke, OPS.closeFillStroke, OPS.closeEOFillStroke]);
+    const CLOSING = new Set([OPS.closeStroke, OPS.closeFillStroke, OPS.closeEOFillStroke]);
+    let signature = 0;
+    for (let n = 0; n < ops.fnArray.length; n++) {
+      const fn = ops.fnArray[n], args = ops.argsArray[n];
+      if (fn === OPS.save) stack.push(ctm);
+      else if (fn === OPS.restore) ctm = stack.pop() || ctm;
+      else if (fn === OPS.transform) ctm = mul(ctm, args);
+      else if (fn === OPS.paintFormXObjectBegin) { stack.push(ctm); if (args[0]) ctm = mul(ctm, args[0]); }
+      else if (fn === OPS.paintFormXObjectEnd) ctm = stack.pop() || ctm;
+      else if (fn === OPS.constructPath) {
+        const [pops, pargs] = args;
+        for (let i = 0, j = 0; i < pops.length; i++) {
+          const op = pops[i] | 0;
+          if (op === OPS.rectangle) {
+            const [x, y, w, h] = pargs.slice(j, j + 4); j += 4;
+            const pts = [[x, y], [x + w, y], [x + w, y + h], [x, y + h]].map(([a, b]) => dev(a, b));
+            newSub(pts[0], "re");
+            cur.pts.push(...pts.slice(1));
+            cur.closed = true;
+            if (isFrame(pts)) cur.frame = true;
+            cur = null; pos = [x, y];
+          } else if (op === OPS.moveTo) {
+            pos = [pargs[j++], pargs[j++]];
+            newSub(dev(...pos));
+          } else if (op === OPS.lineTo) {
+            pos = [pargs[j++], pargs[j++]];
+            if (!cur) newSub(dev(...pos));
+            else { cur.pts.push(dev(...pos)); cur.kinds.add("l"); }
+          } else if (op === OPS.curveTo || op === OPS.curveTo2 || op === OPS.curveTo3) {
+            let c1, c2, end;
+            if (op === OPS.curveTo) { c1 = [pargs[j], pargs[j + 1]]; c2 = [pargs[j + 2], pargs[j + 3]]; end = [pargs[j + 4], pargs[j + 5]]; j += 6; }
+            else if (op === OPS.curveTo2) { c1 = pos; c2 = [pargs[j], pargs[j + 1]]; end = [pargs[j + 2], pargs[j + 3]]; j += 4; }
+            else { c1 = [pargs[j], pargs[j + 1]]; end = [pargs[j + 2], pargs[j + 3]]; c2 = end; j += 4; }
+            if (!cur) newSub(dev(...pos));
+            cur.pts.push(...flattenBezier(dev(...pos), dev(...c1), dev(...c2), dev(...end), tolPt));
+            cur.kinds.add("c");
+            pos = end;
+          } else if (op === OPS.closePath) {
+            if (cur) { cur.closed = true; const start = cur.pts[0]; cur = null; newSub(start); }
+          }
+        }
+      } else if (PAINT.has(fn) || fn === OPS.endPath) {
+        if (PAINT.has(fn)) {
+          if (CLOSING.has(fn) && cur) cur.closed = true;
+          for (const sp of subpaths) {
+            if (sp.frame || sp.pts.length < 2) continue;
+            let pts = sp.pts.map(([x, y]) => [x * PT_TO_MM, (H - y) * PT_TO_MM]);
+            const d0 = Math.hypot(pts[0][0] - pts.at(-1)[0], pts[0][1] - pts.at(-1)[1]);
+            let closed = sp.closed || d0 < 1e-3;
+            if (closed && pts.length > 2 && d0 < 1e-3) pts = pts.slice(0, -1);
+            // skip exact duplicates (same path stroked twice)
+            const key = pts.length + ":" + pts[0].map((v) => v.toFixed(3)) + ":" + pts.at(-1).map((v) => v.toFixed(3));
+            if (key === signature) continue;
+            signature = key;
+            if (detectCircles && closed && sp.kinds.size === 1 && sp.kinds.has("c")) {
+              const c = asCircle(pts, tolMm);
+              if (c) { drawing.circles.push(c); continue; }
+            }
+            drawing.polylines.push({ points: pts, closed: closed && pts.length > 2 });
+          }
+        }
+        subpaths = []; cur = null;
+      }
+    }
+    return drawing;
+  }
+
+  async function convertPdf(file, o, progress) {
+    progress("Caricamento PDF.js…");
+    const lib = await loadPdfJs();
+    progress("Lettura PDF…");
+    const pdf = await lib.getDocument({ data: new Uint8Array(await file.arrayBuffer()) }).promise;
+    const pageNo = Number(o.page) || 1;
+    if (pageNo < 1 || pageNo > pdf.numPages) throw new Error(`Pagina ${pageNo} inesistente (il PDF ha ${pdf.numPages} pagine)`);
+    const page = await pdf.getPage(pageNo);
+    if (!o.raster) {
+      const drawing = await extractVectors(lib, page, o.tolerance ?? 0.05, !o.no_circles);
+      if (drawing.polylines.length || drawing.circles.length) return { drawing, method: "vettoriale" };
+    }
+    // Scanned page (or forced raster): render at a known DPI and vectorize.
+    const vp1 = page.getViewport({ scale: 1 });
+    let dpi = Number(o.raster_dpi) || 600;
+    const maxDpi = 72 * Math.sqrt(MAX_PIXELS / (vp1.width * vp1.height));
+    if (dpi > maxDpi) dpi = Math.floor(maxDpi);
+    progress(`Rendering a ${dpi} dpi…`);
+    const vp = page.getViewport({ scale: dpi / 72 });
+    const c = document.createElement("canvas");
+    c.width = Math.floor(vp.width); c.height = Math.floor(vp.height);
+    const ctx = c.getContext("2d", { willReadFrequently: true });
+    ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, c.width, c.height);
+    await page.render({ canvasContext: ctx, viewport: vp }).promise;
+    const rgba = ctx.getImageData(0, 0, c.width, c.height).data, d = new Uint8Array(c.width * c.height);
+    for (let i = 0; i < d.length; i++) d[i] = Math.round(0.299 * rgba[4 * i] + 0.587 * rgba[4 * i + 1] + 0.114 * rgba[4 * i + 2]);
+    const pxPerMm = c.width / (vp1.width * PT_TO_MM);
+    const drawing = await vectorize({ w: c.width, h: c.height, d }, pxPerMm, o, progress);
+    return { drawing, method: `raster ${dpi} dpi` };
+  }
+
+  // ------------------------------------------------------------ DXF R12
+  function bounds(dr) {
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    for (const p of dr.polylines) for (const [x, y] of p.points) { x0 = Math.min(x0, x); y0 = Math.min(y0, y); x1 = Math.max(x1, x); y1 = Math.max(y1, y); }
+    for (const c of dr.circles) {
+      x0 = Math.min(x0, c.center[0] - c.radius); y0 = Math.min(y0, c.center[1] - c.radius);
+      x1 = Math.max(x1, c.center[0] + c.radius); y1 = Math.max(y1, c.center[1] + c.radius);
+    }
+    return [x0, y0, x1, y1];
+  }
+
+  /** DXF R12 (AC1009) text: LINE, POLYLINE/VERTEX/SEQEND, CIRCLE; units mm. */
+  function writeDxf(dr) {
+    const out = [];
+    const g = (code, value) => out.push(String(code).padStart(3), String(value));
+    const f = (v) => { const s = (+v).toFixed(6).replace(/\.?0+$/, ""); return s === "-0" ? "0" : s.includes(".") ? s : s + ".0"; };
+    const [x0, y0, x1, y1] = bounds(dr);
+    g(0, "SECTION"); g(2, "HEADER");
+    g(9, "$ACADVER"); g(1, "AC1009");
+    g(9, "$INSBASE"); g(10, "0.0"); g(20, "0.0"); g(30, "0.0");
+    g(9, "$EXTMIN"); g(10, f(x0)); g(20, f(y0)); g(30, "0.0");
+    g(9, "$EXTMAX"); g(10, f(x1)); g(20, f(y1)); g(30, "0.0");
+    g(9, "$LIMMIN"); g(10, f(x0)); g(20, f(y0));
+    g(9, "$LIMMAX"); g(10, f(x1)); g(20, f(y1));
+    g(0, "ENDSEC");
+    g(0, "SECTION"); g(2, "TABLES");
+    g(0, "TABLE"); g(2, "LTYPE"); g(70, 1);
+    g(0, "LTYPE"); g(2, "CONTINUOUS"); g(70, 0); g(3, "Solid line"); g(72, 65); g(73, 0); g(40, "0.0");
+    g(0, "ENDTAB");
+    g(0, "TABLE"); g(2, "LAYER"); g(70, 3);
+    for (const [name, color] of [["0", 7], ["LINEE", 7], ["CERCHI", 1]]) {
+      g(0, "LAYER"); g(2, name); g(70, 0); g(62, color); g(6, "CONTINUOUS");
+    }
+    g(0, "ENDTAB");
+    g(0, "ENDSEC");
+    g(0, "SECTION"); g(2, "BLOCKS"); g(0, "ENDSEC");
+    g(0, "SECTION"); g(2, "ENTITIES");
+    for (const p of dr.polylines) {
+      const pts = [];
+      for (const q of p.points) if (!pts.length || Math.hypot(q[0] - pts.at(-1)[0], q[1] - pts.at(-1)[1]) > 1e-6) pts.push(q);
+      let closed = p.closed;
+      if (pts.length > 2 && Math.hypot(pts[0][0] - pts.at(-1)[0], pts[0][1] - pts.at(-1)[1]) <= 1e-6) { pts.pop(); closed = true; }
+      if (pts.length < 2) continue;
+      if (pts.length === 2 && !closed) {
+        g(0, "LINE"); g(8, "LINEE");
+        g(10, f(pts[0][0])); g(20, f(pts[0][1])); g(30, "0.0");
+        g(11, f(pts[1][0])); g(21, f(pts[1][1])); g(31, "0.0");
+        continue;
+      }
+      g(0, "POLYLINE"); g(8, "LINEE"); g(66, 1); g(10, "0.0"); g(20, "0.0"); g(30, "0.0"); g(70, closed ? 1 : 0);
+      for (const [x, y] of pts) { g(0, "VERTEX"); g(8, "LINEE"); g(10, f(x)); g(20, f(y)); g(30, "0.0"); }
+      g(0, "SEQEND"); g(8, "LINEE");
+    }
+    for (const c of dr.circles) {
+      g(0, "CIRCLE"); g(8, "CERCHI"); g(10, f(c.center[0])); g(20, f(c.center[1])); g(30, "0.0"); g(40, f(c.radius));
+    }
+    g(0, "ENDSEC");
+    g(0, "EOF");
+    return out.join("\r\n") + "\r\n";
+  }
+
+  // ------------------------------------------------------------ entry point
+  /** Same options as the CLI / web API. Returns the preview + DXF text. */
+  async function convert(file, opts, progress = () => {}) {
+    const isPdf = /\.pdf$/i.test(file.name) || file.type === "application/pdf";
+    const sheet = !!opts.sheet;
+    const o = {
+      ...opts,
+      mode: opts.mode || "centerline",
+      threshold: opts.threshold || (sheet ? "adaptive" : "otsu"),
+      invert: !!opts.invert,
+      tolerance: opts.tolerance != null && opts.tolerance !== "" ? Number(opts.tolerance) : isPdf ? 0.05 : 0.2,
+      minLength: opts.min_length != null && opts.min_length !== "" ? Number(opts.min_length) : 2,
+      resolution: Number(opts.resolution) || 10,
+      margin: opts.margin != null && opts.margin !== "" ? Number(opts.margin) : sheet ? 5 : 0,
+    };
+    let { drawing, method } = isPdf ? await convertPdf(file, o, progress) : await convertImage(file, o, progress);
+    let factor = Number(opts.scale) || 1;
+    if (opts.calibrate) {
+      const [measured, real] = nums(opts.calibrate, 2, "Calibrazione");
+      if (!(measured > 0 && real > 0)) throw new Error("La calibrazione richiede valori positivi");
+      factor *= real / measured;
+    }
+    if (factor !== 1)
+      drawing = {
+        polylines: drawing.polylines.map((p) => ({ points: p.points.map(([x, y]) => [x * factor, y * factor]), closed: p.closed })),
+        circles: drawing.circles.map((c) => ({ center: [c.center[0] * factor, c.center[1] * factor], radius: c.radius * factor })),
+      };
+    if (!drawing.polylines.length && !drawing.circles.length) throw new Error("Nessuna geometria trovata nell'input");
+    progress("Scrittura DXF…");
+    return { ok: true, method, bounds: bounds(drawing), ...drawing, dxf: writeDxf(drawing) };
+  }
+
+  return { convert, readDpi, detectSheet, PAPER };
+})();
+</script>
 
 <script>
 const $ = (id) => document.getElementById(id);
@@ -368,14 +1221,7 @@ $("convert").onclick = async () => {
   btn.disabled = true; btn.textContent = "Conversione in corso…";
   try {
     const q = new URLSearchParams({ filename: file.name, options: JSON.stringify(options) });
-    let res;
-    try {
-      res = await fetch("/api/convert?" + q, { method: "POST", body: file });
-    } catch (_) {
-      throw new Error(NO_SERVER);
-    }
-    const data = await readJson(res);
-    if (!data.ok) throw new Error(data.error || "Errore sconosciuto");
+    const data = await DXF.convert(file, options, (msg) => { btn.textContent = msg; });
     result = data;
     calFactor = options.calibrate ?
       Number(options.calibrate.split(",")[1]) / Number(options.calibrate.split(",")[0]) : 1;
@@ -387,34 +1233,6 @@ $("convert").onclick = async () => {
   }
 };
 
-const NO_SERVER =
-  "Questa pagina non è servita da dxfconv, quindi non può convertire.\n" +
-  "Apri un terminale nella cartella del progetto ed esegui:\n" +
-  "    pip install -r requirements.txt\n" +
-  "    python -m dxfconv.web\n" +
-  "poi usa la pagina che si apre su http://127.0.0.1:8000/ " +
-  "(non aprire il file index.html con doppio clic o da un'anteprima).";
-
-// Only trust responses that really are JSON from the dxfconv server.
-async function readJson(res) {
-  const type = res.headers.get("content-type") || "";
-  if (!type.includes("application/json")) throw new Error(NO_SERVER);
-  return res.json();
-}
-
-async function checkServer() {
-  let ok = false;
-  if (location.protocol.startsWith("http")) {
-    try {
-      const data = await readJson(await fetch("/api/ping"));
-      ok = data.app === "dxfconv";
-    } catch (_) { /* not our server */ }
-  }
-  const banner = $("serverBanner");
-  banner.textContent = NO_SERVER;
-  banner.classList.toggle("hidden", ok);
-}
-checkServer();
 
 function showError(msg) { $("error").textContent = msg; $("error").classList.remove("hidden"); }
 function hideError() { $("error").classList.add("hidden"); }

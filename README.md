@@ -23,23 +23,31 @@ python -m dxfconv foto.jpg --ref 120,340,980,352 --ref-length 200
 
 Dopo l'installazione con `pip install .` è disponibile anche il comando `dxfconv`.
 
-## Pagina web per provare
+## Pagina web (senza installare nulla)
 
-```bash
-python -m dxfconv.web            # apre http://127.0.0.1:8000/ nel browser
-```
+Il file [`dxfconv/static/index.html`](dxfconv/static/index.html) è
+**autonomo**: basta aprirlo con doppio clic nel browser (Chrome, Edge, Firefox,
+Safari) e convertire. Tutta l'elaborazione avviene nel browser, i file non
+vengono inviati a nessun server. Per i PDF la pagina scarica la libreria
+PDF.js da internet; le immagini funzionano anche offline.
 
-La pagina (`dxfconv/static/index.html`) permette di:
+La pagina permette di:
 
 * trascinare un PDF o una foto e scegliere il metodo di scala;
 * **cliccare sull'immagine** i due punti di riferimento o i 4 angoli del foglio;
 * vedere l'**anteprima** del DXF con griglia da 10 mm, zoom e coordinate;
 * **misurare** una distanza sull'anteprima (con aggancio ai vertici) e usarla
   per la calibrazione;
-* scaricare il file DXF.
+* scaricare il file DXF R12.
 
-La conversione avviene sul tuo computer: il server ascolta solo su `127.0.0.1`
-(opzioni `--port`, `--host`, `--no-browser`).
+Il motore JavaScript è un porting del pacchetto Python e dà gli stessi
+risultati (differenze di pochi decimi di millimetro nella vettorizzazione delle
+immagini). Le immagini molto grandi vengono ridotte a 16 megapixel per
+l'elaborazione, mantenendo la scala corretta; il formato TIFF non è supportato
+dai browser (usare PNG o JPG).
+
+In alternativa la stessa pagina può essere servita in locale con
+`python -m dxfconv.web` (apre http://127.0.0.1:8000/).
 
 ## Come si ottiene la scala 1:1
 
